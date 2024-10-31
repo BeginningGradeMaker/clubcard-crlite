@@ -6,4 +6,6 @@
 pub mod builder;
 
 mod query;
+pub mod partition;
+pub mod partition_metadata;
 pub use query::{CRLiteClubcard, CRLiteCoverage, CRLiteKey, CRLiteQuery, CRLiteStatus};
