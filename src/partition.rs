@@ -9,6 +9,7 @@ extern crate base64;
 extern crate hex;
 use crate::partition_metadata::{partition_metadata, Partition, PartitionRecord};
 use base64::Engine;
+use clubcard::ApproximateSizeOf;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -18,7 +19,32 @@ use std::path::{Path, PathBuf};
 
 type IssuerSPKIHash = [u8; 32];
 #[derive(Default, Serialize, Deserialize)]
-pub struct PartitionMetadata(HashMap<IssuerSPKIHash, Option<Partition>>);
+pub struct PartitionMetadata(pub HashMap<IssuerSPKIHash, Partition>);
+
+impl PartitionMetadata {
+    pub fn partition_index(&self, issuer: &[u8; 32], not_after: u64) -> Option<usize> {
+        let partition = self.0.get(issuer)?;
+
+        let partition_idx = match partition.binary_search_by(|&some_not_after| {
+            if some_not_after > not_after {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        }) {
+            Ok(pos) => pos, // this happens when a greater value is directly found
+            _ => partition.len(),
+        };
+
+        Some(partition_idx)
+    }
+}
+
+impl ApproximateSizeOf for PartitionMetadata {
+    fn approximate_size_of(&self) -> usize {
+        size_of::<Self>()
+    }
+}
 
 struct RevokedSerialAndReasonIterator {
     lines: Option<Lines<BufReader<File>>>,
@@ -94,7 +120,7 @@ impl PartitionBuilder {
         partition_revoked_dir: &Path,
         partition_known_dir: &Path,
     ) -> Self {
-        PartitionBuilder {
+        Self {
             revoked_dir: revoked_dir.to_path_buf(),
             known_dir: known_dir.to_path_buf(),
             partition_revoked_dir: partition_revoked_dir.to_path_buf(),
@@ -134,7 +160,7 @@ impl PartitionBuilder {
     }
 
     fn partition_issuer(
-        & mut self,
+        &mut self,
         issuer: OsString,
         maybe_revoked_file: Option<PathBuf>,
         known_file: PathBuf,
@@ -202,7 +228,7 @@ impl PartitionBuilder {
 
         let mut known_writer = create_partition_writer(&self.partition_known_dir, partition_idx);
         for (timestamp, (known_set, _)) in &universe_count {
-            while partition_idx < usize::min(partition_len, 256)
+            while partition_idx < usize::min(partition_len, 255)
                 && *timestamp > partition[partition_idx]
             {
                 partition_idx += 1;
@@ -220,7 +246,7 @@ impl PartitionBuilder {
         partition_idx = 0;
         let mut known_writer = create_partition_writer(&self.partition_revoked_dir, partition_idx);
         for (timestamp, (_, revoked_set)) in &universe_count {
-            while partition_idx < usize::min(partition_len, 256)
+            while partition_idx < usize::min(partition_len, 255)
                 && *timestamp > partition[partition_idx]
             {
                 partition_idx += 1;
@@ -236,18 +262,24 @@ impl PartitionBuilder {
         Some(partition)
     }
 
-    pub fn partition_directory(& mut self) -> PartitionMetadata {
+    pub fn partition_directory(&mut self) -> PartitionMetadata {
         let pairs = self.list_issuer_file_pairs();
         let mut metadata = PartitionMetadata::default();
 
         for (issuer, maybe_revoked_file, known_file) in pairs {
-            metadata.0.insert(
-                self.decode_issuer(issuer.to_str().unwrap()),
-                self.partition_issuer(issuer, maybe_revoked_file, known_file),
-            );
+            if let Some(partition) =
+                self.partition_issuer(issuer.clone(), maybe_revoked_file, known_file)
+            {
+                metadata
+                    .0
+                    .insert(self.decode_issuer(issuer.to_str().unwrap()), partition);
+            }
         }
 
-        println!("The approximated size after partition is {}", self.approx_size);
+        println!(
+            "The approximated size after partition is {}",
+            self.approx_size
+        );
         metadata
     }
 }

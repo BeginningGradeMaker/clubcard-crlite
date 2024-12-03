@@ -87,7 +87,7 @@ fn main() -> std::process::ExitCode {
 
     let issuer_spki_hash: [u8; 32] = Sha256::digest(issuer.tbs_certificate.subject_pki.raw).into();
     let serial = cert.tbs_certificate.raw_serial();
-    let key = CRLiteKey::new(&issuer_spki_hash, &serial);
+    let key = CRLiteKey::new(&issuer_spki_hash, &serial, cert.tbs_certificate.validity().not_after.timestamp() as u64);
 
     match filter.contains(&key, scts.iter().map(|sct| (sct.id.key_id, sct.timestamp))) {
         CRLiteStatus::Good => println!("Good"),

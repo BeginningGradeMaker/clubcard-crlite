@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use crate::partition::PartitionMetadata;
 use base64::Engine;
 use clubcard::{
     ApproximateSizeOf, AsQuery, Clubcard, ClubcardIndex, Equation, Membership, Queryable,
@@ -28,10 +29,11 @@ pub struct CRLiteKey<'a> {
     pub(crate) issuer: &'a IssuerSpkiHash,
     pub(crate) serial: &'a [u8],
     pub(crate) issuer_serial_hash: [u8; 32],
+    pub(crate) not_after: u64,
 }
 
 impl<'a> CRLiteKey<'a> {
-    pub fn new(issuer: &'a IssuerSpkiHash, serial: &'a [u8]) -> CRLiteKey<'a> {
+    pub fn new(issuer: &'a IssuerSpkiHash, serial: &'a [u8], timestamp: u64) -> CRLiteKey<'a> {
         let mut issuer_serial_hash = [0u8; 32];
         let mut hasher = Sha256::new();
         hasher.update(issuer);
@@ -41,6 +43,7 @@ impl<'a> CRLiteKey<'a> {
             issuer,
             serial,
             issuer_serial_hash,
+            not_after: timestamp,
         }
     }
 }
@@ -49,17 +52,43 @@ impl<'a> CRLiteKey<'a> {
 pub struct CRLiteQuery<'a> {
     pub(crate) key: &'a CRLiteKey<'a>,
     pub(crate) log_timestamp: Option<(&'a LogId, Timestamp)>,
+    pub(crate) block_id: Vec<u8>,
 }
 
 impl<'a> CRLiteQuery<'a> {
-    pub fn new(key: &'a CRLiteKey<'a>, log_timestamp: Option<(&'a LogId, u64)>) -> CRLiteQuery<'a> {
-        CRLiteQuery { key, log_timestamp }
+    pub fn new_from_metadata(
+        key: &'a CRLiteKey<'a>,
+        log_timestamp: Option<(&'a LogId, u64)>,
+        partition_meta: &PartitionMetadata,
+    ) -> CRLiteQuery<'a> {
+        // obtain the partiton index using binary search
+        let mut block_id = key.issuer.to_vec();
+        let Some(partition_idx) = partition_meta.partition_index(key.issuer, key.not_after) else {
+            return CRLiteQuery {
+                key,
+                log_timestamp,
+                block_id,
+            };
+        };
+        block_id.push(partition_idx as u8);
+
+        CRLiteQuery { key, log_timestamp, block_id }
+    }
+
+    pub fn new(
+        key: &'a CRLiteKey<'a>,
+        log_timestamp: Option<(&'a LogId, u64)>,
+        block_id: Vec<u8>,
+    ) -> CRLiteQuery<'a> {
+        // obtain the partiton index using binary search
+        CRLiteQuery { key, log_timestamp, block_id }
     }
 }
 
 impl<'a> AsQuery<W> for CRLiteQuery<'a> {
+    // TODO: adjust it for partition
     fn block(&self) -> &[u8] {
-        self.key.issuer.as_ref()
+        self.block_id.as_ref()
     }
 
     fn as_query(&self, m: usize) -> Equation<W> {
@@ -90,7 +119,7 @@ impl<'a> Queryable<W> for CRLiteQuery<'a> {
     // The set of CRLiteKeys is partitioned by issuer, and each
     // CRLiteKey knows its issuer. So there's no need for additional
     // partition metadata.
-    type PartitionMetadata = ();
+    type PartitionMetadata = PartitionMetadata;
 
     fn in_universe(&self, universe: &Self::UniverseMetadata) -> bool {
         let Some((log_id, timestamp)) = self.log_timestamp else {
@@ -131,16 +160,16 @@ impl From<Membership> for CRLiteStatus {
     }
 }
 
-pub struct CRLiteClubcard(Clubcard<W, CRLiteCoverage, ()>);
+pub struct CRLiteClubcard(Clubcard<W, CRLiteCoverage, PartitionMetadata>);
 
-impl From<Clubcard<W, CRLiteCoverage, ()>> for CRLiteClubcard {
-    fn from(inner: Clubcard<W, CRLiteCoverage, ()>) -> CRLiteClubcard {
+impl From<Clubcard<W, CRLiteCoverage, PartitionMetadata>> for CRLiteClubcard {
+    fn from(inner: Clubcard<W, CRLiteCoverage, PartitionMetadata>) -> CRLiteClubcard {
         CRLiteClubcard(inner)
     }
 }
 
-impl AsRef<Clubcard<W, CRLiteCoverage, ()>> for CRLiteClubcard {
-    fn as_ref(&self) -> &Clubcard<W, CRLiteCoverage, ()> {
+impl AsRef<Clubcard<W, CRLiteCoverage, PartitionMetadata>> for CRLiteClubcard {
+    fn as_ref(&self) -> &Clubcard<W, CRLiteCoverage, PartitionMetadata> {
         &self.0
     }
 }
@@ -240,13 +269,17 @@ impl CRLiteClubcard {
         self.0.index()
     }
 
+    pub fn partition(&self) -> &PartitionMetadata {
+        self.0.partition()
+    }
+
     pub fn contains<'a>(
         &self,
         key: &'a CRLiteKey<'a>,
         timestamps: impl Iterator<Item = (&'a LogId, Timestamp)>,
     ) -> CRLiteStatus {
         for (log_id, timestamp) in timestamps {
-            let crlite_query = CRLiteQuery::new(key, Some((log_id, timestamp)));
+            let crlite_query = CRLiteQuery::new_from_metadata(key, Some((log_id, timestamp)), self.partition());
             let status = self.0.contains(&crlite_query).into();
             if status == CRLiteStatus::NotCovered {
                 continue;
