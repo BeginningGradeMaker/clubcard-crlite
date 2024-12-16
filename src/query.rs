@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-use crate::partition::PartitionMetadata;
+use crate::partition::PartitionIndex;
 use base64::Engine;
 use clubcard::{
     ApproximateSizeOf, AsQuery, Clubcard, ClubcardIndex, Equation, Membership, Queryable,
@@ -59,7 +59,7 @@ impl<'a> CRLiteQuery<'a> {
     pub fn new_from_metadata(
         key: &'a CRLiteKey<'a>,
         log_timestamp: Option<(&'a LogId, u64)>,
-        partition_meta: &PartitionMetadata,
+        partition_meta: &PartitionIndex,
     ) -> CRLiteQuery<'a> {
         // obtain the partiton index using binary search
         let mut block_id = key.issuer.to_vec();
@@ -72,7 +72,11 @@ impl<'a> CRLiteQuery<'a> {
         };
         block_id.push(partition_idx as u8);
 
-        CRLiteQuery { key, log_timestamp, block_id }
+        CRLiteQuery {
+            key,
+            log_timestamp,
+            block_id,
+        }
     }
 
     pub fn new(
@@ -81,7 +85,11 @@ impl<'a> CRLiteQuery<'a> {
         block_id: Vec<u8>,
     ) -> CRLiteQuery<'a> {
         // obtain the partiton index using binary search
-        CRLiteQuery { key, log_timestamp, block_id }
+        CRLiteQuery {
+            key,
+            log_timestamp,
+            block_id,
+        }
     }
 }
 
@@ -119,7 +127,7 @@ impl<'a> Queryable<W> for CRLiteQuery<'a> {
     // The set of CRLiteKeys is partitioned by issuer, and each
     // CRLiteKey knows its issuer. So there's no need for additional
     // partition metadata.
-    type PartitionMetadata = PartitionMetadata;
+    type PartitionMetadata = PartitionIndex;
 
     fn in_universe(&self, universe: &Self::UniverseMetadata) -> bool {
         let Some((log_id, timestamp)) = self.log_timestamp else {
@@ -160,16 +168,16 @@ impl From<Membership> for CRLiteStatus {
     }
 }
 
-pub struct CRLiteClubcard(Clubcard<W, CRLiteCoverage, PartitionMetadata>);
+pub struct CRLiteClubcard(Clubcard<W, CRLiteCoverage, PartitionIndex>);
 
-impl From<Clubcard<W, CRLiteCoverage, PartitionMetadata>> for CRLiteClubcard {
-    fn from(inner: Clubcard<W, CRLiteCoverage, PartitionMetadata>) -> CRLiteClubcard {
+impl From<Clubcard<W, CRLiteCoverage, PartitionIndex>> for CRLiteClubcard {
+    fn from(inner: Clubcard<W, CRLiteCoverage, PartitionIndex>) -> CRLiteClubcard {
         CRLiteClubcard(inner)
     }
 }
 
-impl AsRef<Clubcard<W, CRLiteCoverage, PartitionMetadata>> for CRLiteClubcard {
-    fn as_ref(&self) -> &Clubcard<W, CRLiteCoverage, PartitionMetadata> {
+impl AsRef<Clubcard<W, CRLiteCoverage, PartitionIndex>> for CRLiteClubcard {
+    fn as_ref(&self) -> &Clubcard<W, CRLiteCoverage, PartitionIndex> {
         &self.0
     }
 }
@@ -233,12 +241,9 @@ impl std::fmt::Display for CRLiteClubcard {
 }
 
 impl CRLiteClubcard {
-    // Cascade-based CRLite filters use version numbers 0x0000, 0x0001, and 0x0002.
-    const SERIALIZATION_VERSION: u16 = 0x0003;
-
     /// Serialize this clubcard.
     pub fn to_bytes(&self) -> Result<Vec<u8>, ClubcardError> {
-        let mut out = u16::to_le_bytes(Self::SERIALIZATION_VERSION).to_vec();
+        let mut out = u16::to_le_bytes(0x0004).to_vec();
         bincode::serialize_into(&mut out, &self.0).map_err(|_| ClubcardError::Serialize)?;
         Ok(out)
     }
@@ -253,12 +258,19 @@ impl CRLiteClubcard {
             return Err(ClubcardError::Deserialize);
         };
         let version = u16::from_le_bytes(version_bytes);
-        if version != Self::SERIALIZATION_VERSION {
-            return Err(ClubcardError::UnsupportedVersion);
+        match version {
+            0x0003 => {
+                let clubcard_v3: Clubcard<W, CRLiteCoverage, ()> =
+                    bincode::deserialize(rest).map_err(|_| ClubcardError::Deserialize)?;
+                Ok(CRLiteClubcard(clubcard_v3.convert()))
+            }
+            0x0004 => {
+                let clubcard_v4: Clubcard<W, CRLiteCoverage, PartitionIndex> =
+                    bincode::deserialize(rest).map_err(|_| ClubcardError::Deserialize)?;
+                Ok(CRLiteClubcard(clubcard_v4))
+            }
+            _ => Err(ClubcardError::Deserialize),
         }
-        bincode::deserialize(rest)
-            .map(CRLiteClubcard)
-            .map_err(|_| ClubcardError::Deserialize)
     }
 
     pub fn universe(&self) -> &CRLiteCoverage {
@@ -269,7 +281,7 @@ impl CRLiteClubcard {
         self.0.index()
     }
 
-    pub fn partition(&self) -> &PartitionMetadata {
+    pub fn partition(&self) -> &PartitionIndex {
         self.0.partition()
     }
 
@@ -279,7 +291,8 @@ impl CRLiteClubcard {
         timestamps: impl Iterator<Item = (&'a LogId, Timestamp)>,
     ) -> CRLiteStatus {
         for (log_id, timestamp) in timestamps {
-            let crlite_query = CRLiteQuery::new_from_metadata(key, Some((log_id, timestamp)), self.partition());
+            let crlite_query =
+                CRLiteQuery::new_from_metadata(key, Some((log_id, timestamp)), self.partition());
             let status = self.0.contains(&crlite_query).into();
             if status == CRLiteStatus::NotCovered {
                 continue;

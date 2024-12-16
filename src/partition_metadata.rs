@@ -34,22 +34,6 @@ pub fn log2(num: f64) -> f64 {
     }
 }
 
-fn size_lower_bound_bytes(ok_count: usize, revoked_count: usize) -> f64 {
-    let r = revoked_count as f64;
-    let n = (ok_count + revoked_count) as f64;
-    let entropy = if revoked_count == 0 || ok_count == 0 {
-        0.0
-    } else {
-        let p = r / n;
-        -p * p.log2() - (1.0 - p) * (1.0 - p).log2()
-    };
-    // Any function that can encode an arbitrary r element subset of an n element set needs
-    // an output of length ~log(n choose r) bits. Stirling's approximation to n! implies
-    // that log(n choose r) can be approximated by n*H(r/n) where H is the binary entropy
-    // function.
-    n * entropy / 8.0
-}
-
 pub fn cost(r: u64, n: u64) -> u64 {
     let r = r.min(n - r);
     if r == 0 {
@@ -108,6 +92,5 @@ pub fn partition_metadata(records: Vec<PartitionRecord>) -> (Vec<u64>, u64) {
 
     partition_meta.reverse();
 
-    (partition_meta, dp[len-1].0)
+    (partition_meta, dp[len - 1].0)
 }
-

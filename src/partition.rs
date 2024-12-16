@@ -19,9 +19,15 @@ use std::path::{Path, PathBuf};
 
 type IssuerSPKIHash = [u8; 32];
 #[derive(Default, Serialize, Deserialize)]
-pub struct PartitionMetadata(pub HashMap<IssuerSPKIHash, Partition>);
+pub struct PartitionIndex(pub HashMap<IssuerSPKIHash, Partition>);
 
-impl PartitionMetadata {
+impl From<()> for PartitionIndex {
+    fn from(_: ()) -> Self {
+        Default::default()
+    }
+}
+
+impl PartitionIndex {
     pub fn partition_index(&self, issuer: &[u8; 32], not_after: u64) -> Option<usize> {
         let partition = self.0.get(issuer)?;
 
@@ -40,7 +46,7 @@ impl PartitionMetadata {
     }
 }
 
-impl ApproximateSizeOf for PartitionMetadata {
+impl ApproximateSizeOf for PartitionIndex {
     fn approximate_size_of(&self) -> usize {
         size_of::<Self>()
     }
@@ -262,9 +268,9 @@ impl PartitionBuilder {
         Some(partition)
     }
 
-    pub fn partition_directory(&mut self) -> PartitionMetadata {
+    pub fn partition_directory(&mut self) -> PartitionIndex {
         let pairs = self.list_issuer_file_pairs();
-        let mut metadata = PartitionMetadata::default();
+        let mut metadata = PartitionIndex::default();
 
         for (issuer, maybe_revoked_file, known_file) in pairs {
             if let Some(partition) =
