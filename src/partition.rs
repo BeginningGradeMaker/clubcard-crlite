@@ -189,7 +189,6 @@ pub struct PartitionBuilder {
     known_dir: PathBuf,
     partition_revoked_dir: PathBuf,
     partition_known_dir: PathBuf,
-    approx_size: u64,
 }
 
 impl PartitionBuilder {
@@ -204,7 +203,6 @@ impl PartitionBuilder {
             known_dir: known_dir.to_path_buf(),
             partition_revoked_dir: partition_revoked_dir.to_path_buf(),
             partition_known_dir: partition_known_dir.to_path_buf(),
-            approx_size: 0,
         }
     }
 
@@ -214,8 +212,6 @@ impl PartitionBuilder {
             .filter_map(|x| x.ok())
             .map(|x| x.file_name())
             .collect();
-        self.approx_size += approx_size;
-        self.approx_size += approx_size;
 
         let mut pairs = vec![];
         for issuer in known_issuers {
@@ -274,8 +270,6 @@ impl PartitionBuilder {
                 .entry(timestamp)
                 .or_default()
                 .0
-        self.approx_size += approx_size;
-        self.approx_size += approx_size;
                 .insert(serial);
         }
 
@@ -357,23 +351,28 @@ impl PartitionBuilder {
         Some((partition, approx_size))
     }
 
-    pub fn partition_directory(&mut self) -> PartitionIndex {
-        let pairs = self.list_issuer_file_pairs();
+    pub fn partition_directory(self) -> PartitionIndex {
+        let mut pairs = self.list_issuer_file_pairs();
         let mut metadata = PartitionIndex::default();
+        let mut total_approx_size = 0;
 
-        for (issuer, maybe_revoked_file, known_file) in pairs {
-            if let Some(partition) =
-                self.partition_issuer(issuer.clone(), maybe_revoked_file, known_file)
-            {
-                metadata
-                    .0
-                    .insert(self.decode_issuer(issuer.to_str().unwrap()), partition);
+        let partitions: Vec<_> = pairs
+            .par_iter_mut()
+            .map(|(issuer, maybe_revoked_file, known_file)| {
+                (issuer.clone(), self.partition_issuer(issuer, maybe_revoked_file, known_file))
+            })
+            .collect();
+
+        for (issuer, maybe_partition) in partitions {
+            if let Some((partition, approx_size)) = maybe_partition {
+                total_approx_size += approx_size;
+                metadata.0.insert(self.decode_issuer(issuer.to_str().unwrap()), partition);
             }
         }
 
         println!(
             "The approximated size after partition is {}",
-            self.approx_size
+            total_approx_size
         );
         metadata
     }
