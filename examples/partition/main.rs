@@ -36,7 +36,7 @@ fn main() -> std::process::ExitCode {
     };
     let mut meta_file = File::create(&meta_path).unwrap();
 
-    let mut partition_builder = PartitionBuilder::new(&revoked_dir, &known_dir, &output_partition_revoked_dir, &output_partition_known_dir);
+    let partition_builder = PartitionBuilder::new(&revoked_dir, &known_dir, &output_partition_revoked_dir, &output_partition_known_dir);
     let partition_metadata = partition_builder.partition_directory();
     let bytes = meta_file
         .write(&bincode::serialize(&partition_metadata).unwrap())

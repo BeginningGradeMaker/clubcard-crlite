@@ -16,6 +16,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1", optional = true }
 sha2 = "0.10"
 hex = "0.4"
+clap = { version = "3.0", features = ["derive"] }
+rayon = "1.5"
 
 [features]
 builder = ["dep:rand", "dep:serde_json", "clubcard/builder"]

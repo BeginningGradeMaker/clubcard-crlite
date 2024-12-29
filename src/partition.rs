@@ -5,11 +5,12 @@
 /* This program provides utilities that takes inputs <revoked_dir> and <known_dir>,
 * and splits each file based on the metadata */
 
-extern crate base64;
-extern crate hex;
 use crate::partition_metadata::{partition_metadata, Partition, PartitionRecord};
+use base64;
 use base64::Engine;
 use clubcard::ApproximateSizeOf;
+use hex;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -28,21 +29,22 @@ impl From<()> for PartitionIndex {
 }
 
 impl PartitionIndex {
+    /// Find the partition index associated with given issuer, returns None if issuer
+    /// is not valid.
+    ///
+    /// * `issuer`: SHA256 issuer hash
+    /// * `not_after`: expiry date of certificate
     pub fn partition_index(&self, issuer: &[u8; 32], not_after: u64) -> Option<usize> {
         let partition = self.0.get(issuer)?;
 
-        let partition_idx = match partition.binary_search_by(|&some_not_after| {
+        // should be equivalent to upper_bound in C++
+        Some(partition.binary_search_by(|&some_not_after| {
             if some_not_after > not_after {
                 std::cmp::Ordering::Greater
             } else {
                 std::cmp::Ordering::Less
             }
-        }) {
-            Ok(pos) => pos, // this happens when a greater value is directly found
-            _ => partition.len(),
-        };
-
-        Some(partition_idx)
+        }).unwrap_or_else(|idx| idx))
     }
 }
 
@@ -52,28 +54,99 @@ impl ApproximateSizeOf for PartitionIndex {
     }
 }
 
+const REASON_UNSPECIFIED: u8 = 0;
+const REASON_KEY_COMPROMISE: u8 = 1;
+const REASON_CA_COMPROMISE: u8 = 2;
+const REASON_AFFILIATION_CHANGED: u8 = 3;
+const REASON_SUPERSEDED: u8 = 4;
+const REASON_CESSATION_OF_OPERATION: u8 = 5;
+const REASON_CERTIFICATE_HOLD: u8 = 6;
+//              -- value 7 is not used
+const REASON_REMOVE_FROM_CRL: u8 = 8;
+const REASON_PRIVILEGE_WITHDRAWN: u8 = 9;
+const REASON_AA_COMPROMISE: u8 = 10;
+
+#[derive(clap::ValueEnum, Copy, Clone)]
+enum ReasonSet {
+    All,
+    Specified,
+    Priority,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+enum Reason {
+    Unspecified = REASON_UNSPECIFIED,
+    KeyCompromise = REASON_KEY_COMPROMISE,
+    CACompromise = REASON_CA_COMPROMISE,
+    AffilitationChanged = REASON_AFFILIATION_CHANGED,
+    Superseded = REASON_SUPERSEDED,
+    CessationOfOperation = REASON_CESSATION_OF_OPERATION,
+    CertificateHold = REASON_CERTIFICATE_HOLD,
+    RemoveFromCRL = REASON_REMOVE_FROM_CRL,
+    PrivilegeWithdrawn = REASON_PRIVILEGE_WITHDRAWN,
+    AACompromise = REASON_AA_COMPROMISE,
+}
+
+impl From<u8> for Reason {
+    fn from(reason_code: u8) -> Reason {
+        match reason_code {
+            REASON_UNSPECIFIED => Reason::Unspecified,
+            REASON_KEY_COMPROMISE => Reason::KeyCompromise,
+            REASON_CA_COMPROMISE => Reason::CACompromise,
+            REASON_AFFILIATION_CHANGED => Reason::AffilitationChanged,
+            REASON_SUPERSEDED => Reason::Superseded,
+            REASON_CESSATION_OF_OPERATION => Reason::CessationOfOperation,
+            REASON_CERTIFICATE_HOLD => Reason::CertificateHold,
+            REASON_REMOVE_FROM_CRL => Reason::RemoveFromCRL,
+            REASON_PRIVILEGE_WITHDRAWN => Reason::PrivilegeWithdrawn,
+            REASON_AA_COMPROMISE => Reason::AACompromise,
+            _ => Reason::Unspecified,
+        }
+    }
+}
+
+fn decode_reason(hex_reason: &str) -> Reason {
+    u8::from_str_radix(hex_reason, 16)
+        .expect("invalid hex encoding")
+        .into()
+}
+
 struct RevokedSerialAndReasonIterator {
     lines: Option<Lines<BufReader<File>>>,
+    reason_set: ReasonSet,
 }
 
 impl RevokedSerialAndReasonIterator {
-    fn new(path: &Path) -> Self {
+    fn new(path: &Path, reason_set: ReasonSet) -> Self {
         Self {
             lines: Some(BufReader::new(File::open(path).unwrap()).lines()),
+            reason_set,
         }
     }
 
-    //fn empty() -> Self {
-    //    Self { lines: None }
-    //}
+    fn skip_reason(&self, reason: &Reason) -> bool {
+        match self.reason_set {
+            ReasonSet::All => false,
+            ReasonSet::Specified => *reason == Reason::Unspecified,
+            ReasonSet::Priority => !matches!(
+                *reason,
+                Reason::KeyCompromise | Reason::CessationOfOperation | Reason::PrivilegeWithdrawn
+            ),
+        }
+    }
 }
 
 impl Iterator for RevokedSerialAndReasonIterator {
-    type Item = Vec<u8>;
+    type Item = (Vec<u8>, Reason);
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(mut line) = self.lines.as_mut()?.next().transpose().expect("IO error") {
+        while let Some(mut line) = self.lines.as_mut()?.next().transpose().expect("IO error") {
+            let reason = decode_reason(&line[..2]);
+            if self.skip_reason(&reason) {
+                continue;
+            }
             let serial = line.split_off(2);
-            return Some(decode_serial(&serial));
+            return Some((decode_serial(&serial), reason));
         }
         None
     }
@@ -141,6 +214,8 @@ impl PartitionBuilder {
             .filter_map(|x| x.ok())
             .map(|x| x.file_name())
             .collect();
+        self.approx_size += approx_size;
+        self.approx_size += approx_size;
 
         let mut pairs = vec![];
         for issuer in known_issuers {
@@ -165,22 +240,32 @@ impl PartitionBuilder {
             .expect("found invalid issuer id: not 32 bytes.")
     }
 
+    /// Shard the universe consisting all certificates of issuer based on not_after timestamps.
+    ///
+    /// * `issuer`: issuer name
+    /// * `maybe_revoked_file`: list of certificates revoked by issuer, each line contains an ascii 
+    ///     hex encoded serial number prefixed by an ascii hex encoded revocation reason code. The 
+    ///     reason codes are one byte.
+    /// * `known_file`: list of certificates issued by issuer, each line contains 
+    ///     1. an ascii hex encoded 64 bit unix timestamp prefixed by "@", or
+    ///     2. an ascii hex encoded certificate serial number.
     fn partition_issuer(
-        &mut self,
-        issuer: OsString,
-        maybe_revoked_file: Option<PathBuf>,
-        known_file: PathBuf,
-    ) -> Option<Vec<u64>> {
+        &self,
+        issuer: &OsString,
+        maybe_revoked_file: &Option<PathBuf>,
+        known_file: &PathBuf,
+    ) -> Option<(Vec<u64>, u64)> {
         // if there is no revoked file, no partition is needed
         let Some(revoked_file) = maybe_revoked_file else {
-            let _ = fs::copy(known_file, self.partition_known_dir.join(&issuer));
+            let _ = fs::copy(known_file, self.partition_known_dir.join(issuer));
             return None;
         };
 
         // count the number of revoked and known certificates for each timestamp
-        let known_lines = KnownSerialIterator::new(&known_file);
+        let known_lines = KnownSerialIterator::new(known_file);
         let mut serial_to_timestamp = HashMap::<Vec<u8>, u64>::new();
-        let mut universe_count = BTreeMap::<u64, (HashSet<Vec<u8>>, HashSet<Vec<u8>>)>::new();
+        let mut universe_count =
+            BTreeMap::<u64, (HashSet<Vec<u8>>, HashSet<(Vec<u8>, Reason)>)>::new();
         for line in known_lines {
             let timestamp = line.0;
             let serial = decode_serial(&line.1);
@@ -189,17 +274,19 @@ impl PartitionBuilder {
                 .entry(timestamp)
                 .or_default()
                 .0
+        self.approx_size += approx_size;
+        self.approx_size += approx_size;
                 .insert(serial);
         }
 
-        let revoked_lines = RevokedSerialAndReasonIterator::new(&revoked_file);
-        for serial in revoked_lines {
+        let revoked_lines = RevokedSerialAndReasonIterator::new(revoked_file, ReasonSet::All);
+        for (serial, reason) in revoked_lines {
             if let Some(timestamp) = serial_to_timestamp.get(&serial) {
-                universe_count
-                    .get_mut(timestamp)
-                    .expect("Timestamp occured in revoked file but not in known file")
-                    .1
-                    .insert(serial);
+                // NOTE: the revoked list can include elements that are not in the known list, so we have to check whether elements 
+                // of the revoked list are in the universe before including them in the count.
+                if let Some((_, revoked_set)) = universe_count.get_mut(timestamp) {
+                    revoked_set.insert((serial, reason));
+                };
             }
         }
 
@@ -213,12 +300,11 @@ impl PartitionBuilder {
         }
 
         let (partition, approx_size) = partition_metadata(partition_records);
-        self.approx_size += approx_size;
         let partition_len = partition.len();
         if partition_len == 0 {
             // copy the un-partitioned file to the output directory.
-            let _ = fs::copy(known_file, self.partition_known_dir.join(&issuer)).unwrap();
-            let _ = fs::copy(revoked_file, self.partition_revoked_dir.join(&issuer)).unwrap();
+            let _ = fs::copy(known_file, self.partition_known_dir.join(issuer)).unwrap();
+            let _ = fs::copy(revoked_file, self.partition_revoked_dir.join(issuer)).unwrap();
             return None;
         }
 
@@ -250,22 +336,25 @@ impl PartitionBuilder {
         }
 
         partition_idx = 0;
-        let mut known_writer = create_partition_writer(&self.partition_revoked_dir, partition_idx);
+        let mut revoked_writer =
+            create_partition_writer(&self.partition_revoked_dir, partition_idx);
         for (timestamp, (_, revoked_set)) in &universe_count {
             while partition_idx < usize::min(partition_len, 255)
                 && *timestamp > partition[partition_idx]
             {
                 partition_idx += 1;
-                let _ = known_writer.flush();
-                known_writer = create_partition_writer(&self.partition_revoked_dir, partition_idx);
+                let _ = revoked_writer.flush();
+                revoked_writer =
+                    create_partition_writer(&self.partition_revoked_dir, partition_idx);
             }
-            for serial in revoked_set {
-                let _ = known_writer.write(hex::encode(serial).as_bytes());
-                let _ = known_writer.write(b"\n");
+            for (serial, reason) in revoked_set {
+                let _ = revoked_writer.write(format!("{:x}", (*reason as u8)).as_bytes());
+                let _ = revoked_writer.write(hex::encode(serial).as_bytes());
+                let _ = revoked_writer.write(b"\n");
             }
         }
 
-        Some(partition)
+        Some((partition, approx_size))
     }
 
     pub fn partition_directory(&mut self) -> PartitionIndex {
