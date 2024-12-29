@@ -377,3 +377,25 @@ impl PartitionBuilder {
         metadata
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::partition::PartitionIndex;
+
+    #[test]
+    fn test_partition_index() {
+        let issuer = [0u8; 32];
+        let partition = vec![1, 10, 50, 200, 1000, 2000];
+        let mut partition_index = PartitionIndex::default();
+        partition_index.0.insert(issuer, partition);
+
+        assert_eq!(partition_index.partition_index(&issuer, 200).unwrap(), 4);
+        assert_eq!(partition_index.partition_index(&issuer, 199).unwrap(), 3);
+        assert_eq!(partition_index.partition_index(&issuer, 0).unwrap(), 0);
+        assert_eq!(partition_index.partition_index(&issuer, 1).unwrap(), 1);
+        assert_eq!(partition_index.partition_index(&issuer, 1000).unwrap(), 5);
+        assert_eq!(partition_index.partition_index(&issuer, 1999).unwrap(), 5);
+        assert_eq!(partition_index.partition_index(&issuer, 2000).unwrap(), 6);
+        assert_eq!(partition_index.partition_index(&issuer, 3000).unwrap(), 6);
+    }
+}
